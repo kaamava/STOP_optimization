@@ -99,6 +99,8 @@ python  main.py \
         --temporal_prompt ${group} \
         --use_relation_loss ${use_relation_loss} \
         --relation_loss_weight ${relation_loss_weight} \
-        --relation_loss_tau ${relation_loss_tau}
+        --relation_loss_tau ${relation_loss_tau} \
+        --use_attn_for_discriminative 1 \
+        --attn_alpha 0.5
 
 echo "Training Finished!!!"
