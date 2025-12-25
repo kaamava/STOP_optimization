@@ -38,6 +38,15 @@ class TemporalPrompt_3(nn.Module):
         self.Cal_Net = nn.Conv3d(3, 1, kernel_size=(5, 11, 11), stride=1, padding=padding_tmp)
         self.eta = 6
         
+        # For attention-based discriminative region identification
+        use_attn = getattr(args, 'use_attn_for_discriminative', False) if args else False
+        if isinstance(use_attn, int):
+            self.use_attn_for_discriminative = bool(use_attn)
+        else:
+            self.use_attn_for_discriminative = use_attn
+        self.attn_weights = None
+        self.attn_alpha = getattr(args, 'attn_alpha', 0.5) if args else 0.5  # Weight for combining attention and temporal variation
+        
         self.InterFramePrompt = self.init_InterFramePrompt(args)
         
     def forward(self, x):
@@ -53,25 +62,144 @@ class TemporalPrompt_3(nn.Module):
         mask = self.get_mask(x)
         return x + prompt*0.05 + prompt*mask*0.05
     
+    def update_attention_weights(self, attn_weights_list, B, T):
+        if not self.use_attn_for_discriminative or not attn_weights_list:
+            return
+        
+        # Aggregate attention weights from multiple layers
+        # Focus on attention weights from frame tokens (excluding CLS and prompt tokens)
+        aggregated_attn = None
+        
+        for layer_attn_weights in attn_weights_list:
+            # layer_attn_weights is a list of attention weights from different attention heads
+            # Each element shape: [num_heads, seq_len, seq_len] or [seq_len, seq_len]
+            if isinstance(layer_attn_weights, list):
+                # Multiple attention outputs (e.g., from different queries)
+                for attn_w in layer_attn_weights:
+                    if attn_w is not None:
+                        # Average over heads if needed
+                        if attn_w.dim() == 3:  # [num_heads, seq_len, seq_len]
+                            attn_w = attn_w.mean(dim=0)  # Average over heads
+                        
+                        if aggregated_attn is None:
+                            aggregated_attn = attn_w
+                        else:
+                            aggregated_attn = aggregated_attn + attn_w
+            else:
+                if layer_attn_weights is not None:
+                    if layer_attn_weights.dim() == 3:
+                        layer_attn_weights = layer_attn_weights.mean(dim=0)
+                    
+                    if aggregated_attn is None:
+                        aggregated_attn = layer_attn_weights
+                    else:
+                        aggregated_attn = aggregated_attn + layer_attn_weights
+        
+        if aggregated_attn is not None:
+            # Normalize
+            aggregated_attn = aggregated_attn / len(attn_weights_list)
+            self.attn_weights = aggregated_attn
+    
+    def _extract_spatial_attention_map(self, attn_weights, B, T, patch_size=16, img_size=224):
+        if attn_weights is None:
+            return None
+        
+        # Get attention from CLS token to patch tokens
+        # Assuming first token is CLS, rest are patches
+        num_patches_per_frame = (img_size // patch_size) ** 2
+        num_tokens_per_frame = num_patches_per_frame + 1  # +1 for CLS
+        
+        # Extract attention from CLS to patches for each frame
+        spatial_attn_maps = []
+        
+        for t in range(T):
+            # Find CLS token position for frame t
+            cls_idx = t * num_tokens_per_frame
+            
+            # Get attention weights from CLS to patches in this frame
+            frame_start = cls_idx + 1  # Skip CLS
+            frame_end = cls_idx + num_tokens_per_frame
+            
+            if frame_end <= attn_weights.size(0):
+                frame_attn = attn_weights[cls_idx, frame_start:frame_end]  # [num_patches]
+                
+                # Reshape to spatial map
+                grid_size = img_size // patch_size
+                spatial_map = frame_attn.reshape(grid_size, grid_size)
+                
+                # Upsample to original image size
+                spatial_map = torch.nn.functional.interpolate(
+                    spatial_map.unsqueeze(0).unsqueeze(0),
+                    size=(img_size, img_size),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0).squeeze(0)
+                
+                spatial_attn_maps.append(spatial_map)
+        
+        if spatial_attn_maps:
+            # Stack: [T, H, W]
+            return torch.stack(spatial_attn_maps, dim=0)
+        return None
+    
     def get_mask(self, x):
         B, T, C, W, H = x.shape
         self.B, self.T = B, T
-        x = x.permute(0, 2, 1, 3, 4)
-        x = self.Cal_Net(x)
-        x = x.squeeze(1)
-        x = x.reshape(B, T, 32, 7, 32, 7)
-        x = x.mean(dim=(2, 4))
-        bar = x.reshape(B, T, -1)
+        
+        # Calculate temporal variation mask (original method)
+        x_temporal = x.permute(0, 2, 1, 3, 4)
+        x_temporal = self.Cal_Net(x_temporal)
+        x_temporal = x_temporal.squeeze(1)
+        x_temporal = x_temporal.reshape(B, T, 32, 7, 32, 7)
+        x_temporal = x_temporal.mean(dim=(2, 4))
+        bar = x_temporal.reshape(B, T, -1)
         bar = bar.sort(dim=2, descending=True)[0]
         bar = bar[:, :, self.eta]
-        x = x > bar.unsqueeze(2).unsqueeze(3)
-        self.mask = x
-        x = x.unsqueeze(2).unsqueeze(4)
-        x = x.repeat(1, 1, 32, 1, 32, 1)
-        x = x.reshape(B, T, 224, 224)
-        x = x.unsqueeze(2)
-        x = x.repeat(1, 1, 3, 1, 1)
-        return x
+        temporal_mask = x_temporal > bar.unsqueeze(2).unsqueeze(3)
+        
+        # Combine with attention-based mask if available
+        if self.use_attn_for_discriminative and self.attn_weights is not None:
+            # Extract spatial attention map from attention weights
+            spatial_attn_map = self._extract_spatial_attention_map(
+                self.attn_weights, B, T, patch_size=16, img_size=224
+            )
+            
+            if spatial_attn_map is not None:
+                # Reshape spatial_attn_map to match temporal_mask shape
+                # spatial_attn_map: [T, 224, 224]
+                # Downsample to match temporal_mask: [B, T, 7, 7]
+                spatial_attn_map = spatial_attn_map.unsqueeze(0).expand(B, -1, -1, -1)  # [B, T, 224, 224]
+                spatial_attn_map = torch.nn.functional.avg_pool2d(
+                    spatial_attn_map.view(B * T, 1, 224, 224),
+                    kernel_size=32, stride=32
+                ).view(B, T, 7, 7)
+                
+                # Normalize attention map
+                spatial_attn_map = (spatial_attn_map - spatial_attn_map.min()) / (
+                    spatial_attn_map.max() - spatial_attn_map.min() + 1e-8
+                )
+                
+                # Threshold attention map
+                attn_threshold = spatial_attn_map.reshape(B, T, -1).sort(dim=2, descending=True)[0][:, :, self.eta]
+                attention_mask = spatial_attn_map > attn_threshold.unsqueeze(2).unsqueeze(3)
+                
+                # Combine temporal variation and attention masks
+                # Use weighted combination: alpha * attention + (1-alpha) * temporal
+                combined_mask = self.attn_alpha * attention_mask.float() + (1 - self.attn_alpha) * temporal_mask.float()
+                combined_mask = combined_mask > 0.5
+                self.mask = combined_mask
+            else:
+                self.mask = temporal_mask
+        else:
+            self.mask = temporal_mask
+        
+        # Reshape mask to original image size
+        mask_out = self.mask.unsqueeze(2).unsqueeze(4)
+        mask_out = mask_out.repeat(1, 1, 32, 1, 32, 1)
+        mask_out = mask_out.reshape(B, T, 224, 224)
+        mask_out = mask_out.unsqueeze(2)
+        mask_out = mask_out.repeat(1, 1, 3, 1, 1)
+        return mask_out
     
     def init_InterFramePrompt(self, args):
         self.Attention = nn.MultiheadAttention(embed_dim = 768, num_heads = 12)

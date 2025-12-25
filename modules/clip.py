@@ -276,18 +276,23 @@ class ResidualAttentionBlock(nn.Module):
         self.phrase_delta = None
 
 
-    def attention(self, q: torch.Tensor,k: torch.Tensor, v: torch.Tensor):
+    def attention(self, q: torch.Tensor,k: torch.Tensor, v: torch.Tensor, return_weights=False):
         attn_mask_ = self.attn_mask
         if self.attn_mask is not None and hasattr(self.attn_mask, '__call__'):
             attn_mask_ = self.attn_mask(q.size(0))   # LND
 
         attn_mask_ = attn_mask_.to(dtype=q.dtype, device=q.device) if attn_mask_ is not None else None
-        output = self.attn(q, k, v, need_weights=False, attn_mask=attn_mask_)[0]
-        return output
+        if return_weights:
+            output, attn_weights = self.attn(q, k, v, need_weights=True, attn_mask=attn_mask_)
+            return output, attn_weights
+        else:
+            output = self.attn(q, k, v, need_weights=False, attn_mask=attn_mask_)[0]
+            return output
 
-    def forward(self, x_tuple:tuple):
+    def forward(self, x_tuple:tuple, return_attn_weights=False):
 
         x, video_frame,visual = x_tuple
+        attn_weights_list = []
 
         if  visual:
             B = x.size(1)
@@ -303,15 +308,32 @@ class ResidualAttentionBlock(nn.Module):
                 key1[:,i:i+B, :] = torch.cat((
                             visual_prompt,
                             query1[:, i:i+B, :]), dim=0)
-            attention_output_frames = self.attention(query1,key1,key1).reshape(-1,B,dim) # [54*num_frames,batch_size, dim]
+            
+            if return_attn_weights:
+                attention_output_frames, attn_weights_frames = self.attention(query1,key1,key1, return_weights=True)
+                attention_output_frames = attention_output_frames.reshape(-1,B,dim)
+                attn_weights_list.append(attn_weights_frames)
+            else:
+                attention_output_frames = self.attention(query1,key1,key1).reshape(-1,B,dim)
+            
             query2 = visual_prompt  # [4, batch_size, dim]
             key2 = torch.cat((visual_prompt,frame_token.reshape(-1,B,dim)),dim=0).to(x.device)   # [4+54*num_frames,batch_size,dim]
-            attention_output_prompt = self.attention(query2,key2,key2)
+            
+            if return_attn_weights:
+                attention_output_prompt, attn_weights_prompt = self.attention(query2,key2,key2, return_weights=True)
+                attn_weights_list.append(attn_weights_prompt)
+            else:
+                attention_output_prompt = self.attention(query2,key2,key2)
+            
             x = x + torch.cat((attention_output_prompt,attention_output_frames),dim=0) #  cancatenate: torch.cat([attn_output_global, attn_output_frames]
 
         else:
             x_ln = self.ln_1(x)
-            attn_out = self.attention(x_ln, x_ln, x_ln)
+            if return_attn_weights:
+                attn_out, attn_weights = self.attention(x_ln, x_ln, x_ln, return_weights=True)
+                attn_weights_list.append(attn_weights)
+            else:
+                attn_out = self.attention(x_ln, x_ln, x_ln)
             x = x + attn_out
             if self.phrase_delta is not None:
                 x = x + self.phrase_delta
@@ -323,7 +345,11 @@ class ResidualAttentionBlock(nn.Module):
             x = x + self.mlp(self.ln_2(x)) + 0.1*self.LoRA(x)
         else:
             x = x + self.mlp(self.ln_2(x))
-        return (x, video_frame,visual)
+        
+        if return_attn_weights:
+            return (x, video_frame,visual), attn_weights_list
+        else:
+            return (x, video_frame,visual)
 
     def set_phrase_delta(self, phrase_delta: torch.Tensor):
         self.phrase_delta = phrase_delta
@@ -338,10 +364,20 @@ class Transformer(nn.Module):
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, i + 1,args)
                                             for i in range(layers)])
 
-    def forward(self, x: torch.Tensor, video_frame=-1, visual=False):
+    def forward(self, x: torch.Tensor, video_frame=-1, visual=False, return_attn_weights=False):
         if not visual:
+            if return_attn_weights:
+                result = self.resblocks((x,video_frame,False), return_attn_weights=True)
+                if isinstance(result, tuple) and len(result) == 2:
+                    return result[0][0], result[1]
+                return result[0][0], []
             return self.resblocks((x,video_frame,False))[0]
         else:
+            if return_attn_weights:
+                result = self.resblocks((x,video_frame,True), return_attn_weights=True)
+                if isinstance(result, tuple) and len(result) == 2:
+                    return result[0][0], result[1]
+                return result[0][0], []
             return self.resblocks((x,video_frame,True))[0]
 
 
@@ -426,7 +462,7 @@ class VisualTransformer(nn.Module):
         x_prompt = torch.cat((unified_visual_global_prompt,x_local_prompt),dim=1)
         return x_prompt
 
-    def forward_deep_prompt(self, x, unified_visual_prompt):
+    def forward_deep_prompt(self, x, unified_visual_prompt, return_attn_weights=False):
         attn_weights = []
         hidden_states = None
         weights = None
@@ -438,7 +474,12 @@ class VisualTransformer(nn.Module):
         for i in range(num_layers):
             
             if i == 0:
-                hidden_states = self.transformer.resblocks[i]((x,self.video_frames,True))[0]
+                if return_attn_weights:
+                    result, layer_attn_weights = self.transformer.resblocks[i]((x,self.video_frames,True), return_attn_weights=True)
+                    hidden_states = result[0]
+                    attn_weights.append(layer_attn_weights)
+                else:
+                    hidden_states = self.transformer.resblocks[i]((x,self.video_frames,True))[0]
                 
             else:
                 if i <= len(unified_visual_prompt):
@@ -454,9 +495,17 @@ class VisualTransformer(nn.Module):
                  
                     hidden_states = torch.cat((hidden_states_global,hidden_states_local),dim=0)
              
-                hidden_states = self.transformer.resblocks[i]((hidden_states, self.video_frames,True))[0]
+                if return_attn_weights:
+                    result, layer_attn_weights = self.transformer.resblocks[i]((hidden_states, self.video_frames,True), return_attn_weights=True)
+                    hidden_states = result[0]
+                    attn_weights.append(layer_attn_weights)
+                else:
+                    hidden_states = self.transformer.resblocks[i]((hidden_states, self.video_frames,True))[0]
 
-        return hidden_states
+        if return_attn_weights:
+            return hidden_states, attn_weights
+        else:
+            return hidden_states
 
     def forward(self, x: torch.Tensor,unified_visual_prompt, video_frame=-1):
         
@@ -516,11 +565,20 @@ class VisualTransformer(nn.Module):
         x = self.incorporate_prompt(x,unified_visual_prompt[0])
         x = x.permute(1, 0, 2)  					# NLD -> LND
         
-        
+        # Check if we need to extract attention weights for discriminative region identification
+        use_attn_for_discriminative = getattr(self.args, 'use_attn_for_discriminative', False)
+        if isinstance(use_attn_for_discriminative, int):
+            use_attn_for_discriminative = bool(use_attn_for_discriminative)
         
         # org forward 
         #x = self.transformer(x, video_frame=video_frame, visual=True)
-        x= self.forward_deep_prompt(x,unified_visual_prompt)
+        if use_attn_for_discriminative and hasattr(self, 'TemporalPrompt') and self.TemporalPrompt is not None:
+            x, attn_weights = self.forward_deep_prompt(x,unified_visual_prompt, return_attn_weights=True)
+            # Pass attention weights to TemporalPrompt for discriminative region identification
+            if hasattr(self.TemporalPrompt, 'update_attention_weights'):
+                self.TemporalPrompt.update_attention_weights(attn_weights, B, video_frame)
+        else:
+            x= self.forward_deep_prompt(x,unified_visual_prompt)
         x = x.permute(1, 0, 2)  					# LND -> NLD
         
         return x
