@@ -1,18 +1,5 @@
 # [CVPR2025] STOP: Integrated Spatial-Temporal Dynamic Prompting for Video Understanding
 
-<div align="center">
-
-<div>
-      Zichen Liu<sup>1</sup>&emsp; Kunlun Xu<sup>1</sup>&emsp; Bing Su<sup>2</sup>&emsp; Xu Zou<sup>3</sup>&emsp; Yuxin Peng<sup>1</sup>&emsp; Jiahuan Zhou<sup>1 *</sup>
-  </div>
-<div>
-
-  <sup>1</sup>Wangxuan Institute of Computer Technology, Peking University&emsp;
-  <sup>2</sup>Gaoling School of Artificial Intelligence, Renmin University of China&emsp;
-  <sup>3</sup>School of Artificial Intelligence and Automation, Huazhong University of Science and Technology&emsp;
-
-</div>
-</div>
 <p align="center">
   <a href='https://arxiv.org/pdf/2503.15973'><img src='https://img.shields.io/badge/Arxiv-2503.15973-A42C25.svg?logo=arXiv'></a>
   <a href="https://github.com/zhoujiahuan1991/CVPR2025-STOP"><img src="https://hitscounter.dev/api/hit?url=https%3A%2F%2Fgithub.com%2Fzhoujiahuan1991%2FCVPR2025-STOP&label=STOP&icon=github&color=%233d8bfd"></a>
@@ -76,31 +63,3 @@ Taking the MSRVTT dataset as an example, you can run the following command:
 chmod +x ./scripts/msrvtt.sh
 bash ./scripts/msrvtt.sh
 ```
-
-
-### Results
-
- Comparison with state-of-the-art on the MSR-VTT dataset. For a fair comparison,all methods use CLIP-ViT-B/32 as the backbone. “Params” represents the number of trainable parameters of each method. The best and second best results are marked in RED and BLUE, respectively.
-
-![Results](figs/Result_1.png)
-
-
-### Citation
-If you find this code useful for your research, please cite our paper.
-```
-@article{liu2025stop,
-  title={STOP: Integrated Spatial-Temporal Dynamic Prompting for Video Understanding},
-  author={Liu, Zichen and Xu, Kunlun and Su, Bing and Zou, Xu and Peng, Yuxin and Zhou, Jiahuan},
-  journal={arXiv preprint arXiv:2503.15973},
-  year={2025}
-}
-```
-
-
-### Acknowledgement
-Our code is based on the [DGL](https://github.com/knightyxp/DGL) and [CLIP4clip](https://github.com/ArrowLuo/CLIP4Clip). Thanks for their impressive works!
-
-### Contact
-For any questions, feel free to contact us ([lzc20180720@stu.pku.edu.cn](lzc20180720@stu.pku.edu.cn)).
-
-Welcome to our Laboratory Homepage ([OV<sup>3</sup> Lab](https://zhoujiahuan1991.github.io/)) for more information about our papers, source codes, and datasets.
