@@ -247,6 +247,12 @@ def get_args(description='DGL on Retrieval Task'):
     
     parser.add_argument('--temporal_prompt', type=str, default="DGL")
     
+    ## add for attention-based discriminative region identification
+    parser.add_argument('--use_attn_for_discriminative', type=int, default=1,
+                        help='Use attention weights to identify discriminative regions (1) or only temporal variation (0)')
+    parser.add_argument('--attn_alpha', type=float, default=0.5,
+                        help='Weight for combining attention mask and temporal variation mask (0.0-1.0)')
+    
     
     args = parser.parse_args()
 
