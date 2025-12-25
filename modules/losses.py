@@ -79,19 +79,13 @@ class MaxMarginRankingLoss(nn.Module):
             max_margin = max_margin * self.mm_mask.to(max_margin.device)
         return max_margin.mean()
 
-
-
-
-
-
-
 class RelationJSLoss(nn.Module):
     """
     用样本间关系分布（余弦相似 -> softmax 概率）对齐两个表示空间的 JS 散度损失。
     - 输入: x, y 形状均为 [N, D]
     - 输出: 标量 loss
     - tau: 温度（越小分布越尖锐）
-    - detach_target: 将对向的 KL 目标分布从计算图中分离，常用于蒸馏场景提高稳定性（可选）
+    - detach_target: 将对向的 KL 目标分布从计算图中分离，常用于蒸馏场景提高稳定性
     """
     def __init__(self, tau: float = 0.1, detach_target: bool = False):
         super().__init__()
@@ -108,7 +102,7 @@ class RelationJSLoss(nn.Module):
         返回形状 [N, N]。
         """
         z = self._l2_normalize(z)             # [N, D]
-        sim = z @ z.t()                        # [N, N] 余弦相似（已归一化因此点乘≈cos）
+        sim = z @ z.t()                        # [N, N]
         prob = F.softmax(sim / self.tau, dim=1)
         return prob
 
@@ -117,7 +111,7 @@ class RelationJSLoss(nn.Module):
         计算 KL(p || q)，其中 p、q 都是概率分布（每行和为 1）。
         使用 batchmean 规约，返回标量。
         """
-        p_log = torch.log(p.clamp_min(1e-12))  # 数值稳定
+        p_log = torch.log(p.clamp_min(1e-12))
         # PyTorch: kl_div(input=log_probs, target=probs)
         return F.kl_div(p_log, q, reduction="batchmean")
 
@@ -134,7 +128,6 @@ class RelationJSLoss(nn.Module):
         q = self._pairwise_prob(y)             # 来自 y 空间的关系分布
 
         if self.detach_target:
-            # 可选：将对向 KL 的目标分布从计算图中分离，常用于蒸馏稳定训练
             kl_pq = self._kl(p, q.detach())
             kl_qp = self._kl(q, p.detach())
         else:
