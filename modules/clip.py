@@ -295,29 +295,49 @@ class ResidualAttentionBlock(nn.Module):
         attn_weights_list = []
 
         if  visual:
-            B = x.size(1)
-            BT = B*video_frame
+            # After shape normalization in forward_deep_prompt, x is guaranteed to have shape:
+            # [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
+            # where BT = B * T
+            BT = x.size(1)
             T = video_frame
+            B = BT // T if BT >= T else BT
             dim = x.size(-1)
-            visual_prompt,frame_token= x[:self.visual_prompt_length,:,:],x[self.visual_prompt_length:,:,:].reshape(-1,BT,dim)
+            
+            # Extract visual prompt and frame tokens
+            # x shape: [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
+            visual_prompt = x[:self.visual_prompt_length, :, :]  # [visual_prompt_length, BT, dim]
+            frame_token = x[self.visual_prompt_length:, :, :]  # [num_tokens_per_frame * T, BT, dim]
+            
+            # Apply layer norm
             frame_token = self.ln_1(frame_token)
             visual_prompt = self.ln_1(visual_prompt)
-            query1 = frame_token #  Frame tokens: [5+49, batch_size*num_frames, dim]   
-            key1 = torch.zeros(self.visual_prompt_length+query1.size(0),BT,dim).to(x.device)  #[4+ 5+49, batch_size*num_frames,dim]
-            for i in range(0,BT,B):
-                key1[:,i:i+B, :] = torch.cat((
-                            visual_prompt,
-                            query1[:, i:i+B, :]), dim=0)
+            
+            # Query1: frame tokens for self-attention
+            query1 = frame_token  # [num_tokens_per_frame * T, BT, dim]
+            key1 = torch.zeros(self.visual_prompt_length + query1.size(0), BT, dim).to(x.device)
+            for i in range(0, BT, B):
+                key1[:, i:i+B, :] = torch.cat((
+                    visual_prompt[:, i:i+B, :],
+                    query1[:, i:i+B, :]), dim=0)
             
             if return_attn_weights:
-                attention_output_frames, attn_weights_frames = self.attention(query1,key1,key1, return_weights=True)
-                attention_output_frames = attention_output_frames.reshape(-1,B,dim)
+                attention_output_frames, attn_weights_frames = self.attention(query1, key1, key1, return_weights=True)
+                attention_output_frames = attention_output_frames.reshape(-1, B, dim)
                 attn_weights_list.append(attn_weights_frames)
             else:
-                attention_output_frames = self.attention(query1,key1,key1).reshape(-1,B,dim)
+                attention_output_frames = self.attention(query1, key1, key1).reshape(-1, B, dim)
             
-            query2 = visual_prompt  # [4, batch_size, dim]
-            key2 = torch.cat((visual_prompt,frame_token.reshape(-1,B,dim)),dim=0).to(x.device)   # [4+54*num_frames,batch_size,dim]
+            # Query2: visual prompt for cross-attention with frame tokens
+            query2 = visual_prompt  # [visual_prompt_length, BT, dim]
+            # For key2, we need frame tokens in shape [num_tokens_per_frame * T, B, dim]
+            # Extract first B elements from each time step
+            if frame_token.size(1) == BT and BT == B * T:
+                # Reshape: [num_tokens_per_frame * T, BT, dim] -> [num_tokens_per_frame * T, T, B, dim] -> [num_tokens_per_frame * T, B, dim]
+                frame_token_for_key2 = frame_token.reshape(frame_token.size(0), T, B, dim)[:, 0, :, :]
+            else:
+                # Fallback: take first B columns
+                frame_token_for_key2 = frame_token[:, :B, :] if frame_token.size(1) >= B else frame_token
+            key2 = torch.cat((visual_prompt[:, :B, :], frame_token_for_key2), dim=0).to(x.device)
             
             if return_attn_weights:
                 attention_output_prompt, attn_weights_prompt = self.attention(query2,key2,key2, return_weights=True)
@@ -462,45 +482,162 @@ class VisualTransformer(nn.Module):
         x_prompt = torch.cat((unified_visual_global_prompt,x_local_prompt),dim=1)
         return x_prompt
 
+    def _normalize_shape_for_transformer(self, x, B, T, dim, visual_prompt_length):
+        """
+        Unified shape normalization for transformer layers.
+        Ensures x has shape [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
+        where BT = B * T
+        
+        Args:
+            x: Input tensor of shape [L, B, dim] or [L, BT, dim]
+            B: Batch size
+            T: Number of video frames
+            dim: Feature dimension
+            visual_prompt_length: Length of visual prompt tokens
+            
+        Returns:
+            normalized_x: Tensor of shape [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
+            num_tokens_per_frame: Number of tokens per frame (excluding prompt)
+        """
+        L, current_B, _ = x.shape
+        BT = B * T
+        
+        # Extract visual prompt and frame tokens
+        visual_prompt = x[:visual_prompt_length, :, :]  # [visual_prompt_length, current_B, dim]
+        frame_token_raw = x[visual_prompt_length:, :, :]  # [L_remaining, current_B, dim]
+        L_remaining = frame_token_raw.size(0)
+        
+        # Normalize visual prompt to [visual_prompt_length, BT, dim]
+        if current_B == BT:
+            visual_prompt_normalized = visual_prompt
+        elif current_B == B:
+            # Expand from [visual_prompt_length, B, dim] to [visual_prompt_length, BT, dim]
+            visual_prompt_normalized = visual_prompt.unsqueeze(1).expand(-1, T, -1, -1).reshape(visual_prompt_length, BT, dim)
+        else:
+            # Fallback: repeat or take first B
+            if visual_prompt.size(1) >= BT:
+                visual_prompt_normalized = visual_prompt[:, :BT, :]
+            else:
+                # Repeat to match BT
+                repeat_factor = BT // visual_prompt.size(1)
+                visual_prompt_normalized = visual_prompt.repeat(1, repeat_factor, 1)[:, :BT, :]
+        
+        # Normalize frame tokens to [num_tokens_per_frame * T, BT, dim]
+        total_elements = L_remaining * current_B * dim
+        
+        if total_elements % (BT * dim) == 0:
+            # Can directly reshape
+            first_dim = total_elements // (BT * dim)
+            frame_token_normalized = frame_token_raw.reshape(L_remaining, current_B, dim)
+            if current_B == BT:
+                frame_token_normalized = frame_token_normalized.reshape(first_dim, BT, dim)
+            elif current_B == B:
+                # Reshape: [L_remaining, B, dim] -> [L_remaining, T, B, dim] -> [L_remaining*T, BT, dim]
+                if L_remaining % T == 0:
+                    tokens_per_frame = L_remaining // T
+                    frame_token_normalized = frame_token_raw.reshape(T, tokens_per_frame, B, dim).permute(1, 0, 2, 3).reshape(tokens_per_frame * T, BT, dim)
+                else:
+                    # Cannot divide evenly, use repeat
+                    frame_token_normalized = frame_token_raw.unsqueeze(1).expand(-1, T, -1, -1).reshape(L_remaining * T, BT, dim)
+            else:
+                # Fallback: try to reshape directly
+                frame_token_normalized = frame_token_raw.reshape(first_dim, BT, dim) if first_dim * BT * dim == total_elements else frame_token_raw[:, :BT, :]
+            
+            num_tokens_per_frame = first_dim // T if first_dim % T == 0 else L_remaining
+        else:
+            # Cannot reshape directly, use fallback
+            if current_B == B and L_remaining % T == 0:
+                tokens_per_frame = L_remaining // T
+                frame_token_normalized = frame_token_raw.reshape(T, tokens_per_frame, B, dim).permute(1, 0, 2, 3).reshape(tokens_per_frame * T, BT, dim)
+                num_tokens_per_frame = tokens_per_frame
+            else:
+                # Last resort: keep original and adjust
+                frame_token_normalized = frame_token_raw
+                if current_B == B:
+                    frame_token_normalized = frame_token_normalized.unsqueeze(1).expand(-1, T, -1, -1).reshape(L_remaining * T, BT, dim)
+                elif current_B < BT:
+                    # Repeat to match BT
+                    repeat_factor = BT // current_B
+                    frame_token_normalized = frame_token_raw.repeat(1, repeat_factor, 1)[:, :BT, :]
+                else:
+                    frame_token_normalized = frame_token_raw[:, :BT, :]
+                num_tokens_per_frame = L_remaining
+        
+        # Concatenate normalized visual prompt and frame tokens
+        normalized_x = torch.cat((visual_prompt_normalized, frame_token_normalized), dim=0)
+        
+        return normalized_x, num_tokens_per_frame
+
     def forward_deep_prompt(self, x, unified_visual_prompt, return_attn_weights=False):
         attn_weights = []
         hidden_states = None
         weights = None
         B = x.shape[1]
+        T = self.video_frames
+        dim = x.size(-1)
+        visual_prompt_length = self.num_tokens
 
         num_layers = self.transformer.layers
         
+        # Normalize input shape for first layer
+        x_normalized, num_tokens_per_frame = self._normalize_shape_for_transformer(
+            x, B, T, dim, visual_prompt_length
+        )
 
         for i in range(num_layers):
             
             if i == 0:
                 if return_attn_weights:
-                    result, layer_attn_weights = self.transformer.resblocks[i]((x,self.video_frames,True), return_attn_weights=True)
+                    result, layer_attn_weights = self.transformer.resblocks[i]((x_normalized, T, True), return_attn_weights=True)
                     hidden_states = result[0]
                     attn_weights.append(layer_attn_weights)
                 else:
-                    hidden_states = self.transformer.resblocks[i]((x,self.video_frames,True))[0]
+                    hidden_states = self.transformer.resblocks[i]((x_normalized, T, True))[0]
                 
             else:
                 if i <= len(unified_visual_prompt):
-                    unified_visual_frame_prompt = unified_visual_prompt[i].reshape(B,self.video_frames,self.num_tokens,x.size(-1)).permute(2,1,0,3)
+                    unified_visual_frame_prompt = unified_visual_prompt[i].reshape(B, T, self.num_tokens, dim).permute(2, 1, 0, 3)
+                    # unified_visual_frame_prompt: [num_tokens, T, B, dim]
+                    # Reshape to [num_tokens * T, BT, dim]
+                    unified_visual_frame_prompt_reshaped = unified_visual_frame_prompt.reshape(self.num_tokens * T, B * T, dim)
                     
                     hidden_states_global = hidden_states[:self.num_tokens, :, :]
-                    hidden_states = hidden_states[self.num_tokens:, :, :].reshape(-1,self.video_frames,B,x.size(-1))
-                    hidden_states_local = torch.cat((
-                        hidden_states[:1,:,:,:],
-                        unified_visual_frame_prompt,
-                        hidden_states[1+self.num_tokens:,:,:,:],
-                    ), dim=0).reshape(-1,B,x.size(-1))
+                    # hidden_states after first layer: [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
+                    # Extract frame tokens: [num_tokens_per_frame * T, BT, dim]
+                    frame_tokens = hidden_states[self.num_tokens:, :, :]
+                    
+                    # Reshape frame_tokens to insert per-frame prompts
+                    # frame_tokens: [num_tokens_per_frame * T, BT, dim]
+                    # Reshape to [num_tokens_per_frame, T, BT, dim] then to [num_tokens_per_frame, T, B, dim]
+                    if frame_tokens.size(0) == num_tokens_per_frame * T:
+                        frame_tokens_reshaped = frame_tokens.reshape(num_tokens_per_frame, T, B * T, dim)
+                        # Take first B from each time step: [num_tokens_per_frame, T, B, dim]
+                        frame_tokens_per_frame = frame_tokens_reshaped[:, :, :B, :]
+                        # Insert prompts: [1, T, B, dim] + [num_tokens, T, B, dim] + [num_tokens_per_frame-1, T, B, dim]
+                        hidden_states_local = torch.cat((
+                            frame_tokens_per_frame[:1, :, :, :],  # CLS token: [1, T, B, dim]
+                            unified_visual_frame_prompt.reshape(self.num_tokens, T, B, dim),  # Prompts: [num_tokens, T, B, dim]
+                            frame_tokens_per_frame[1:, :, :, :],  # Rest tokens: [num_tokens_per_frame-1, T, B, dim]
+                        ), dim=0)  # [1+num_tokens+num_tokens_per_frame-1, T, B, dim] = [num_tokens_per_frame+num_tokens, T, B, dim]
+                        # Reshape to [num_tokens_per_frame+num_tokens, BT, dim]
+                        hidden_states_local = hidden_states_local.reshape(num_tokens_per_frame + self.num_tokens, B * T, dim)
+                    else:
+                        # Fallback: keep original structure
+                        hidden_states_local = frame_tokens
                  
-                    hidden_states = torch.cat((hidden_states_global,hidden_states_local),dim=0)
+                    hidden_states = torch.cat((hidden_states_global, hidden_states_local), dim=0)
+                    
+                    # Normalize shape for next layer
+                    hidden_states, _ = self._normalize_shape_for_transformer(
+                        hidden_states, B, T, dim, self.num_tokens
+                    )
              
                 if return_attn_weights:
-                    result, layer_attn_weights = self.transformer.resblocks[i]((hidden_states, self.video_frames,True), return_attn_weights=True)
+                    result, layer_attn_weights = self.transformer.resblocks[i]((hidden_states, T, True), return_attn_weights=True)
                     hidden_states = result[0]
                     attn_weights.append(layer_attn_weights)
                 else:
-                    hidden_states = self.transformer.resblocks[i]((hidden_states, self.video_frames,True))[0]
+                    hidden_states = self.transformer.resblocks[i]((hidden_states, T, True))[0]
 
         if return_attn_weights:
             return hidden_states, attn_weights
