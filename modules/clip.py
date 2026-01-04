@@ -309,43 +309,52 @@ class ResidualAttentionBlock(nn.Module):
             frame_token = x[self.visual_prompt_length:, :, :]  # [num_tokens_per_frame * T, BT, dim]
             
             # Apply layer norm
-            frame_token = self.ln_1(frame_token)
-            visual_prompt = self.ln_1(visual_prompt)
+            frame_token_ln = self.ln_1(frame_token)
+            visual_prompt_ln = self.ln_1(visual_prompt)
             
-            # Query1: frame tokens for self-attention
-            query1 = frame_token  # [num_tokens_per_frame * T, BT, dim]
+            
+            # Step 1: Extract CLS token's attention weights for intra-frame attention
+            if return_attn_weights:
+                # Extract CLS token from frame_token (CLS is the first token of each frame)
+                # frame_token shape: [num_tokens_per_frame * T, BT, dim]
+                # For each frame, CLS is at index: t * num_tokens_per_frame
+                # We need to extract CLS tokens for all frames
+                num_tokens_per_frame = 54  # 1 CLS + 49 patches + 4 other tokens
+                cls_indices = [t * num_tokens_per_frame for t in range(T)]
+                cls_tokens = frame_token_ln[cls_indices, :, :]  # [T, BT, dim]
+                
+                # CLS tokens attend to all frame tokens (intra-frame attention)
+                # query = CLS tokens, key = value = frame_token
+                # This gives us CLS token's attention to all tokens within frames
+                _, attn_weights_cls = self.attention(
+                    cls_tokens, frame_token_ln, frame_token_ln, return_weights=True
+                )
+                # attn_weights_cls shape: [T, num_tokens_per_frame * T] (after averaging heads)
+                # This represents CLS token's attention to all tokens within frames
+                attn_weights_list.append(attn_weights_cls)
+            
+            # Step 2: Cross-attention between frame tokens and visual prompt (for feature update)
+            # Frame tokens attend to [visual_prompt, frame_token] to incorporate prompt information
+            query1 = frame_token_ln  # [num_tokens_per_frame * T, BT, dim]
             key1 = torch.zeros(self.visual_prompt_length + query1.size(0), BT, dim).to(x.device)
             for i in range(0, BT, B):
                 key1[:, i:i+B, :] = torch.cat((
-                    visual_prompt[:, i:i+B, :],
+                    visual_prompt_ln[:, i:i+B, :],
                     query1[:, i:i+B, :]), dim=0)
             
             if return_attn_weights:
-                attention_output_frames, attn_weights_frames = self.attention(query1, key1, key1, return_weights=True)
+                attention_output_frames, _ = self.attention(query1, key1, key1, return_weights=True)
                 attention_output_frames = attention_output_frames.reshape(-1, B, dim)
-                attn_weights_list.append(attn_weights_frames)
             else:
                 attention_output_frames = self.attention(query1, key1, key1).reshape(-1, B, dim)
             
-            # Query2: visual prompt for cross-attention with frame tokens
-            query2 = visual_prompt  # [visual_prompt_length, BT, dim]
-            # For key2, we need frame tokens in shape [num_tokens_per_frame * T, B, dim]
-            # Extract first B elements from each time step
-            if frame_token.size(1) == BT and BT == B * T:
-                # Reshape: [num_tokens_per_frame * T, BT, dim] -> [num_tokens_per_frame * T, T, B, dim] -> [num_tokens_per_frame * T, B, dim]
-                frame_token_for_key2 = frame_token.reshape(frame_token.size(0), T, B, dim)[:, 0, :, :]
-            else:
-                # Fallback: take first B columns
-                frame_token_for_key2 = frame_token[:, :B, :] if frame_token.size(1) >= B else frame_token
-            key2 = torch.cat((visual_prompt[:, :B, :], frame_token_for_key2), dim=0).to(x.device)
+            # Step 3: Visual prompt self-attention
+            # Visual prompt tokens attend to themselves
+            query2 = visual_prompt_ln  # [visual_prompt_length, BT, dim]
+            attention_output_prompt = self.attention(query2, query2, query2)
             
-            if return_attn_weights:
-                attention_output_prompt, attn_weights_prompt = self.attention(query2,key2,key2, return_weights=True)
-                attn_weights_list.append(attn_weights_prompt)
-            else:
-                attention_output_prompt = self.attention(query2,key2,key2)
-            
-            x = x + torch.cat((attention_output_prompt,attention_output_frames),dim=0) #  cancatenate: torch.cat([attn_output_global, attn_output_frames]
+            # Combine outputs
+            x = x + torch.cat((attention_output_prompt, attention_output_frames), dim=0)
 
         else:
             x_ln = self.ln_1(x)

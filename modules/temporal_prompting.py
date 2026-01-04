@@ -63,14 +63,26 @@ class TemporalPrompt_3(nn.Module):
         return x + prompt*0.05 + prompt*mask*0.05
     
     def update_attention_weights(self, attn_weights_list, B, T):
+        """
+        Update attention weights for discriminative region identification.
+        
+        According to the paper: "By combining this information with intra-frame attention weights"
+        We need to extract CLS token's attention weights to patch tokens within each frame.
+        This represents how CLS token attends to patch tokens within each frame.
+        
+        Args:
+            attn_weights_list: List of attention weights from transformer layers
+            B: Batch size
+            T: Number of video frames
+        """
         if not self.use_attn_for_discriminative or not attn_weights_list:
             return
         
         # Use only the first layer's attention weights (before prompt injection)
-        # In visual mode, the first layer returns two attention weights:
-        # 1. attn_weights_frames: [frame_token_len, key1_len] - attention from frame tokens
-        # 2. attn_weights_prompt: [visual_prompt_len, key2_len] - attention from visual prompt
-        # We only need the frame tokens attention for discriminative region identification
+        # According to paper: extract CLS token's attention weights from pre-trained model
+        # The first layer returns CLS tokens' attention weights
+        # Shape: [T, num_tokens_per_frame * T] (after averaging heads) - optimized version
+        # or [num_tokens_per_frame * T, num_tokens_per_frame * T] (full self-attention matrix)
         
         first_layer_attn = None
         
@@ -80,24 +92,34 @@ class TemporalPrompt_3(nn.Module):
             # Process first layer attention weights
             if isinstance(layer_attn_weights, list):
                 # In visual mode, we get multiple attention outputs
-                # Use the first one (frame tokens attention) which has shape [frame_token_len, key_len]
+                # The first one should be CLS tokens' attention
                 for attn_w in layer_attn_weights:
                     if attn_w is not None:
                         # Average over heads if needed
-                        if attn_w.dim() == 3:  # [num_heads, seq_len, seq_len]
-                            attn_w = attn_w.mean(dim=0)  # Average over heads -> [seq_len, seq_len]
+                        if attn_w.dim() == 3:  # [num_heads, query_len, key_len]
+                            attn_w = attn_w.mean(dim=0)  # Average over heads -> [query_len, key_len]
                         
-                        # Check if this is frame tokens attention (should be larger)
-                        # frame tokens: typically 54 (49 patches + 5 other tokens)
-                        # visual prompt: typically 4
-                        # We want the frame tokens attention which has more rows
-                        if first_layer_attn is None or attn_w.size(0) > first_layer_attn.size(0):
+                        # Check if it's CLS tokens' attention [T, num_tokens_per_frame * T]
+                        # or full self-attention matrix [num_tokens_per_frame * T, num_tokens_per_frame * T]
+                        if attn_w.size(0) == T:
+                            # Optimized version: CLS tokens' attention [T, num_tokens_per_frame * T]
                             first_layer_attn = attn_w
+                            break
+                        elif attn_w.size(0) == attn_w.size(1):
+                            # Full self-attention matrix, we'll extract CLS tokens' attention later
+                            if first_layer_attn is None or attn_w.size(0) > (first_layer_attn.size(0) if first_layer_attn is not None else 0):
+                                first_layer_attn = attn_w
             else:
                 if layer_attn_weights is not None:
                     if layer_attn_weights.dim() == 3:
-                        layer_attn_weights = layer_attn_weights.mean(dim=0)  # [seq_len, seq_len]
-                    first_layer_attn = layer_attn_weights
+                        layer_attn_weights = layer_attn_weights.mean(dim=0)  # [query_len, key_len]
+                    # Check if it's CLS tokens' attention or full self-attention matrix
+                    if layer_attn_weights.size(0) == T:
+                        # Optimized version: CLS tokens' attention
+                        first_layer_attn = layer_attn_weights
+                    elif layer_attn_weights.size(0) == layer_attn_weights.size(1):
+                        # Full self-attention matrix
+                        first_layer_attn = layer_attn_weights
         
         if first_layer_attn is not None:
             self.attn_weights = first_layer_attn
@@ -105,52 +127,63 @@ class TemporalPrompt_3(nn.Module):
             self.attn_weights = None
     
     def _extract_spatial_attention_map(self, attn_weights, B, T, patch_size=16, img_size=224):
+        """
+        Extract spatial attention map from CLS token's attention weights.
+        
+        According to the paper: extract attention from CLS token to patch tokens
+        within each frame. This represents the model's attention to different spatial regions.
+        
+        Args:
+            attn_weights: CLS token's attention weights [T, num_tokens_per_frame * T]
+                         or [num_tokens_per_frame * T, num_tokens_per_frame * T] (full self-attention matrix)
+            B: Batch size
+            T: Number of video frames
+            patch_size: Patch size (default 16)
+            img_size: Image size (default 224)
+        
+        Returns:
+            spatial_attn_maps: [T, img_size, img_size] spatial attention maps for each frame
+        """
         if attn_weights is None:
             return None
-        
-        # In visual mode, attention weights shape depends on the structure
-        # Based on code: query1 = frame_token, key1 = [visual_prompt, frame_token]
-        # frame_token is reshaped from x[visual_prompt_length:, :, :] which contains all frames
-        # So frame_token shape is [num_tokens_per_frame * T, BT, dim]
-        # But after reshape in attention, it becomes [num_tokens_per_frame * T, BT, dim]
         
         num_patches_per_frame = (img_size // patch_size) ** 2  # 49 for 224x224 with patch_size=16
         grid_size = img_size // patch_size  # 14 for 224x224 with patch_size=16
         
-        # According to code comment: frame_token is [5+49, batch_size*num_frames, dim]
-        # So num_tokens_per_frame = 54 (1 CLS + 49 patches + 4 other)
-        num_tokens_per_frame = 54  # This matches the comment in code
+        # According to CLIP structure: each frame has 1 CLS + 49 patches + 4 other tokens = 54 tokens
+        num_tokens_per_frame = 54  # 1 CLS + 49 patches + 4 other tokens
         
         # Check attention weights shape
-        query_len = attn_weights.size(0)  # Should be num_tokens_per_frame * T
-        key_len = attn_weights.size(1)    # Should be visual_prompt_len + num_tokens_per_frame * T
-        
-        visual_prompt_len = 4
-        
-        # Calculate how many frames are in the attention weights
-        if query_len % num_tokens_per_frame == 0:
-            num_frames_in_attn = query_len // num_tokens_per_frame
+        # If it's [T, num_tokens_per_frame * T], it's already CLS tokens' attention
+        # If it's [num_tokens_per_frame * T, num_tokens_per_frame * T], it's full self-attention matrix
+        if attn_weights.dim() == 2:
+            if attn_weights.size(0) == T:
+                # Shape: [T, num_tokens_per_frame * T] - CLS tokens' attention (optimized version)
+                cls_attn_weights = attn_weights
+            elif attn_weights.size(0) == attn_weights.size(1):
+                # Shape: [num_tokens_per_frame * T, num_tokens_per_frame * T] - full self-attention matrix
+                # Extract CLS tokens' attention from the matrix
+                cls_indices = [t * num_tokens_per_frame for t in range(T)]
+                cls_attn_weights = attn_weights[cls_indices, :]  # [T, num_tokens_per_frame * T]
+            else:
+                return None
         else:
-            # Fallback: assume single frame structure
-            num_frames_in_attn = 1
-            num_tokens_per_frame = query_len
+            return None
         
         # Extract attention from CLS token to patch tokens for each frame
         spatial_attn_maps = []
         
-        for t in range(min(T, num_frames_in_attn)):
-            # CLS token index for frame t in query
-            cls_query_idx = t * num_tokens_per_frame  # CLS is first token of each frame
+        for t in range(T):
+            # CLS token's attention for frame t
+            cls_attn_frame = cls_attn_weights[t, :]  # [num_tokens_per_frame * T]
             
-            # In key, frame_token starts after visual_prompt
-            # For frame t, patches start at: visual_prompt_len + t * num_tokens_per_frame + 1
-            key_frame_start = visual_prompt_len + t * num_tokens_per_frame
-            key_patch_start = key_frame_start + 1  # Skip CLS in frame_token
-            key_patch_end = key_frame_start + 1 + num_patches_per_frame
+            # For frame t, patches are at indices: t * num_tokens_per_frame + 1 to t * num_tokens_per_frame + 1 + 49
+            patch_start_idx = t * num_tokens_per_frame + 1  # Skip CLS token
+            patch_end_idx = patch_start_idx + num_patches_per_frame
             
-            if cls_query_idx < query_len and key_patch_end <= key_len:
-                # Extract attention from CLS to patches
-                frame_attn = attn_weights[cls_query_idx, key_patch_start:key_patch_end]  # [num_patches]
+            if patch_end_idx <= cls_attn_frame.size(0):
+                # Extract attention from CLS to patches (intra-frame attention)
+                frame_attn = cls_attn_frame[patch_start_idx:patch_end_idx]  # [num_patches]
                 
                 # Reshape to spatial map [grid_size, grid_size]
                 if frame_attn.numel() == num_patches_per_frame:
