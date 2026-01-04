@@ -514,12 +514,12 @@ class VisualTransformer(nn.Module):
         if x.ndim == 4:
             BT, C, H, W = x.shape
             B = BT // video_frame
-            
+        
+        # Store original video frames for TemporalPrompt
+        original_video_frames = None
         if self.args.temporal_prompt in ['group2-2']:
-            x = x.reshape(-1, video_frame, x.shape[-3], x.shape[-2], x.shape[-1]) 
-            x = self.TemporalPrompt(x)
-            x = x.reshape(-1, x.shape[-3], x.shape[-2], x.shape[-1]) 
-
+            original_video_frames = x.clone() if x.ndim == 5 else x.reshape(B, video_frame, C, H, W)
+            
         if self.linear_patch == '3d':
             assert video_frame != -1
             # [B, T, C, H, W]
@@ -554,7 +554,32 @@ class VisualTransformer(nn.Module):
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
         
+        # According to paper: Extract attention weights BEFORE generating prompts
+        # This matches: "combining intra-frame attention weights and temporal variation"
+        use_attn_for_discriminative = getattr(self.args, 'use_attn_for_discriminative', False)
+        if isinstance(use_attn_for_discriminative, int):
+            use_attn_for_discriminative = bool(use_attn_for_discriminative)
+        
+        # Extract attention weights from first transformer layer (before prompt injection)
+        # This is the "intra-frame attention weights" mentioned in the paper
+        if use_attn_for_discriminative and hasattr(self, 'TemporalPrompt') and self.TemporalPrompt is not None:
+            # Run first transformer layer to get attention weights (without prompts)
+            x_before_prompt = x.permute(1, 0, 2)  # NLD -> LND
+            result, first_layer_attn = self.transformer.resblocks[0]((x_before_prompt, video_frame, True), return_attn_weights=True)
+            # Pass attention weights to TemporalPrompt BEFORE calling forward()
+            # This ensures get_mask() can use attention weights when called
+            if hasattr(self.TemporalPrompt, 'update_attention_weights'):
+                self.TemporalPrompt.update_attention_weights(first_layer_attn, B, video_frame)
+        
         if self.args.temporal_prompt in ['group2-2']: 
+            # Now TemporalPrompt.forward() can use attention weights in get_mask()
+            # The forward() method will combine attention weights and temporal variation
+            if original_video_frames is not None:
+                x_video_processed = self.TemporalPrompt(original_video_frames)
+            else:
+                # Fallback: reconstruct video frames (should not happen in normal flow)
+                x_video_processed = self.TemporalPrompt(x.reshape(B, video_frame, -1, self.width))
+            
             inter_frame_prompt = self.TemporalPrompt.get_inter_frame_prompt(x)
             if  self.shared_latent_space == "linear":
                 F = int(inter_frame_prompt.shape[2] / unified_visual_prompt.shape[2])
@@ -565,20 +590,9 @@ class VisualTransformer(nn.Module):
         x = self.incorporate_prompt(x,unified_visual_prompt[0])
         x = x.permute(1, 0, 2)  					# NLD -> LND
         
-        # Check if we need to extract attention weights for discriminative region identification
-        use_attn_for_discriminative = getattr(self.args, 'use_attn_for_discriminative', False)
-        if isinstance(use_attn_for_discriminative, int):
-            use_attn_for_discriminative = bool(use_attn_for_discriminative)
-        
         # org forward 
         #x = self.transformer(x, video_frame=video_frame, visual=True)
-        if use_attn_for_discriminative and hasattr(self, 'TemporalPrompt') and self.TemporalPrompt is not None:
-            x, attn_weights = self.forward_deep_prompt(x,unified_visual_prompt, return_attn_weights=True)
-            # Pass attention weights to TemporalPrompt for discriminative region identification
-            if hasattr(self.TemporalPrompt, 'update_attention_weights'):
-                self.TemporalPrompt.update_attention_weights(attn_weights, B, video_frame)
-        else:
-            x= self.forward_deep_prompt(x,unified_visual_prompt)
+        x= self.forward_deep_prompt(x,unified_visual_prompt)
         x = x.permute(1, 0, 2)  					# LND -> NLD
         
         return x

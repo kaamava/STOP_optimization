@@ -66,76 +66,105 @@ class TemporalPrompt_3(nn.Module):
         if not self.use_attn_for_discriminative or not attn_weights_list:
             return
         
-        # Aggregate attention weights from multiple layers
-        # Focus on attention weights from frame tokens (excluding CLS and prompt tokens)
-        aggregated_attn = None
+        # Use only the first layer's attention weights (before prompt injection)
+        # In visual mode, the first layer returns two attention weights:
+        # 1. attn_weights_frames: [frame_token_len, key1_len] - attention from frame tokens
+        # 2. attn_weights_prompt: [visual_prompt_len, key2_len] - attention from visual prompt
+        # We only need the frame tokens attention for discriminative region identification
         
-        for layer_attn_weights in attn_weights_list:
-            # layer_attn_weights is a list of attention weights from different attention heads
-            # Each element shape: [num_heads, seq_len, seq_len] or [seq_len, seq_len]
+        first_layer_attn = None
+        
+        if len(attn_weights_list) > 0:
+            layer_attn_weights = attn_weights_list[0]  # First layer only
+            
+            # Process first layer attention weights
             if isinstance(layer_attn_weights, list):
-                # Multiple attention outputs (e.g., from different queries)
+                # In visual mode, we get multiple attention outputs
+                # Use the first one (frame tokens attention) which has shape [frame_token_len, key_len]
                 for attn_w in layer_attn_weights:
                     if attn_w is not None:
                         # Average over heads if needed
                         if attn_w.dim() == 3:  # [num_heads, seq_len, seq_len]
-                            attn_w = attn_w.mean(dim=0)  # Average over heads
+                            attn_w = attn_w.mean(dim=0)  # Average over heads -> [seq_len, seq_len]
                         
-                        if aggregated_attn is None:
-                            aggregated_attn = attn_w
-                        else:
-                            aggregated_attn = aggregated_attn + attn_w
+                        # Check if this is frame tokens attention (should be larger)
+                        # frame tokens: typically 54 (49 patches + 5 other tokens)
+                        # visual prompt: typically 4
+                        # We want the frame tokens attention which has more rows
+                        if first_layer_attn is None or attn_w.size(0) > first_layer_attn.size(0):
+                            first_layer_attn = attn_w
             else:
                 if layer_attn_weights is not None:
                     if layer_attn_weights.dim() == 3:
-                        layer_attn_weights = layer_attn_weights.mean(dim=0)
-                    
-                    if aggregated_attn is None:
-                        aggregated_attn = layer_attn_weights
-                    else:
-                        aggregated_attn = aggregated_attn + layer_attn_weights
+                        layer_attn_weights = layer_attn_weights.mean(dim=0)  # [seq_len, seq_len]
+                    first_layer_attn = layer_attn_weights
         
-        if aggregated_attn is not None:
-            # Normalize
-            aggregated_attn = aggregated_attn / len(attn_weights_list)
-            self.attn_weights = aggregated_attn
+        if first_layer_attn is not None:
+            self.attn_weights = first_layer_attn
+        else:
+            self.attn_weights = None
     
     def _extract_spatial_attention_map(self, attn_weights, B, T, patch_size=16, img_size=224):
         if attn_weights is None:
             return None
         
-        # Get attention from CLS token to patch tokens
-        # Assuming first token is CLS, rest are patches
-        num_patches_per_frame = (img_size // patch_size) ** 2
-        num_tokens_per_frame = num_patches_per_frame + 1  # +1 for CLS
+        # In visual mode, attention weights shape depends on the structure
+        # Based on code: query1 = frame_token, key1 = [visual_prompt, frame_token]
+        # frame_token is reshaped from x[visual_prompt_length:, :, :] which contains all frames
+        # So frame_token shape is [num_tokens_per_frame * T, BT, dim]
+        # But after reshape in attention, it becomes [num_tokens_per_frame * T, BT, dim]
         
-        # Extract attention from CLS to patches for each frame
+        num_patches_per_frame = (img_size // patch_size) ** 2  # 49 for 224x224 with patch_size=16
+        grid_size = img_size // patch_size  # 14 for 224x224 with patch_size=16
+        
+        # According to code comment: frame_token is [5+49, batch_size*num_frames, dim]
+        # So num_tokens_per_frame = 54 (1 CLS + 49 patches + 4 other)
+        num_tokens_per_frame = 54  # This matches the comment in code
+        
+        # Check attention weights shape
+        query_len = attn_weights.size(0)  # Should be num_tokens_per_frame * T
+        key_len = attn_weights.size(1)    # Should be visual_prompt_len + num_tokens_per_frame * T
+        
+        visual_prompt_len = 4
+        
+        # Calculate how many frames are in the attention weights
+        if query_len % num_tokens_per_frame == 0:
+            num_frames_in_attn = query_len // num_tokens_per_frame
+        else:
+            # Fallback: assume single frame structure
+            num_frames_in_attn = 1
+            num_tokens_per_frame = query_len
+        
+        # Extract attention from CLS token to patch tokens for each frame
         spatial_attn_maps = []
         
-        for t in range(T):
-            # Find CLS token position for frame t
-            cls_idx = t * num_tokens_per_frame
+        for t in range(min(T, num_frames_in_attn)):
+            # CLS token index for frame t in query
+            cls_query_idx = t * num_tokens_per_frame  # CLS is first token of each frame
             
-            # Get attention weights from CLS to patches in this frame
-            frame_start = cls_idx + 1  # Skip CLS
-            frame_end = cls_idx + num_tokens_per_frame
+            # In key, frame_token starts after visual_prompt
+            # For frame t, patches start at: visual_prompt_len + t * num_tokens_per_frame + 1
+            key_frame_start = visual_prompt_len + t * num_tokens_per_frame
+            key_patch_start = key_frame_start + 1  # Skip CLS in frame_token
+            key_patch_end = key_frame_start + 1 + num_patches_per_frame
             
-            if frame_end <= attn_weights.size(0):
-                frame_attn = attn_weights[cls_idx, frame_start:frame_end]  # [num_patches]
+            if cls_query_idx < query_len and key_patch_end <= key_len:
+                # Extract attention from CLS to patches
+                frame_attn = attn_weights[cls_query_idx, key_patch_start:key_patch_end]  # [num_patches]
                 
-                # Reshape to spatial map
-                grid_size = img_size // patch_size
-                spatial_map = frame_attn.reshape(grid_size, grid_size)
-                
-                # Upsample to original image size
-                spatial_map = torch.nn.functional.interpolate(
-                    spatial_map.unsqueeze(0).unsqueeze(0),
-                    size=(img_size, img_size),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(0).squeeze(0)
-                
-                spatial_attn_maps.append(spatial_map)
+                # Reshape to spatial map [grid_size, grid_size]
+                if frame_attn.numel() == num_patches_per_frame:
+                    spatial_map = frame_attn.reshape(grid_size, grid_size)
+                    
+                    # Upsample to original image size
+                    spatial_map = torch.nn.functional.interpolate(
+                        spatial_map.unsqueeze(0).unsqueeze(0),
+                        size=(img_size, img_size),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0).squeeze(0)
+                    
+                    spatial_attn_maps.append(spatial_map)
         
         if spatial_attn_maps:
             # Stack: [T, H, W]
