@@ -307,6 +307,9 @@ class ResidualAttentionBlock(nn.Module):
             expected_frame_tokens = num_tokens_per_frame * T
             has_prompt = (x.size(0) > expected_frame_tokens)
             
+            # Safety check: ensure T > 0
+            assert T > 0, f"Number of frames T must be positive, got T={T}"
+            
             if has_prompt:
                 # Normal forward pass: x contains [visual_prompt, frame_token]
                 # x shape: [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
@@ -326,7 +329,9 @@ class ResidualAttentionBlock(nn.Module):
                         visual_prompt_ln[:, i:i+B, :],
                         query1[:, i:i+B, :]), dim=0)
                 
-                attention_output_frames = self.attention(query1, key1, key1).reshape(-1, B, dim)
+                # attention_output_frames shape: [num_tokens_per_frame * T, BT, dim]
+                # No reshape needed - keep original shape to match x structure
+                attention_output_frames = self.attention(query1, key1, key1)
                 
                 # Step 3: Visual prompt self-attention
                 # Visual prompt tokens attend to themselves
@@ -347,6 +352,10 @@ class ResidualAttentionBlock(nn.Module):
                 if return_attn_weights:
                     # Extract CLS token from frame_token (CLS is the first token of each frame)
                     cls_indices = [t * num_tokens_per_frame for t in range(T)]
+                    # Safety check: ensure all indices are valid
+                    max_idx = max(cls_indices) if cls_indices else -1
+                    assert max_idx < frame_token_ln.size(0), \
+                        f"CLS indices out of range: max_idx={max_idx}, frame_token_ln.size(0)={frame_token_ln.size(0)}"
                     cls_tokens = frame_token_ln[cls_indices, :, :]  # [T, BT, dim]
                     
                     # CLS tokens attend to all frame tokens (intra-frame attention)
