@@ -295,66 +295,76 @@ class ResidualAttentionBlock(nn.Module):
         attn_weights_list = []
 
         if  visual:
-            # After shape normalization in forward_deep_prompt, x is guaranteed to have shape:
-            # [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
-            # where BT = B * T
             BT = x.size(1)
             T = video_frame
             B = BT // T if BT >= T else BT
             dim = x.size(-1)
             
-            # Extract visual prompt and frame tokens
-            # x shape: [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
-            visual_prompt = x[:self.visual_prompt_length, :, :]  # [visual_prompt_length, BT, dim]
-            frame_token = x[self.visual_prompt_length:, :, :]  # [num_tokens_per_frame * T, BT, dim]
+            # Check if input contains prompts or not
+            # When extracting attention weights (before prompt injection), x only contains frame tokens
+            # When doing forward pass (after prompt injection), x contains [visual_prompt, frame_token]
+            num_tokens_per_frame = 54  # 1 CLS + 49 patches + 4 other tokens
+            expected_frame_tokens = num_tokens_per_frame * T
+            has_prompt = (x.size(0) > expected_frame_tokens)
             
-            # Apply layer norm
-            frame_token_ln = self.ln_1(frame_token)
-            visual_prompt_ln = self.ln_1(visual_prompt)
-            
-            
-            # Step 1: Extract CLS token's attention weights for intra-frame attention
-            if return_attn_weights:
-                # Extract CLS token from frame_token (CLS is the first token of each frame)
-                # frame_token shape: [num_tokens_per_frame * T, BT, dim]
-                # For each frame, CLS is at index: t * num_tokens_per_frame
-                # We need to extract CLS tokens for all frames
-                num_tokens_per_frame = 54  # 1 CLS + 49 patches + 4 other tokens
-                cls_indices = [t * num_tokens_per_frame for t in range(T)]
-                cls_tokens = frame_token_ln[cls_indices, :, :]  # [T, BT, dim]
+            if has_prompt:
+                # Normal forward pass: x contains [visual_prompt, frame_token]
+                # x shape: [visual_prompt_length + num_tokens_per_frame * T, BT, dim]
+                visual_prompt = x[:self.visual_prompt_length, :, :]  # [visual_prompt_length, BT, dim]
+                frame_token = x[self.visual_prompt_length:, :, :]  # [num_tokens_per_frame * T, BT, dim]
                 
-                # CLS tokens attend to all frame tokens (intra-frame attention)
-                # query = CLS tokens, key = value = frame_token
-                # This gives us CLS token's attention to all tokens within frames
-                _, attn_weights_cls = self.attention(
-                    cls_tokens, frame_token_ln, frame_token_ln, return_weights=True
-                )
-                # attn_weights_cls shape: [T, num_tokens_per_frame * T] (after averaging heads)
-                # This represents CLS token's attention to all tokens within frames
-                attn_weights_list.append(attn_weights_cls)
-            
-            # Step 2: Cross-attention between frame tokens and visual prompt (for feature update)
-            # Frame tokens attend to [visual_prompt, frame_token] to incorporate prompt information
-            query1 = frame_token_ln  # [num_tokens_per_frame * T, BT, dim]
-            key1 = torch.zeros(self.visual_prompt_length + query1.size(0), BT, dim).to(x.device)
-            for i in range(0, BT, B):
-                key1[:, i:i+B, :] = torch.cat((
-                    visual_prompt_ln[:, i:i+B, :],
-                    query1[:, i:i+B, :]), dim=0)
-            
-            if return_attn_weights:
-                attention_output_frames, _ = self.attention(query1, key1, key1, return_weights=True)
-                attention_output_frames = attention_output_frames.reshape(-1, B, dim)
-            else:
+                # Apply layer norm
+                frame_token_ln = self.ln_1(frame_token)
+                visual_prompt_ln = self.ln_1(visual_prompt)
+                
+                # Step 2: Cross-attention between frame tokens and visual prompt (for feature update)
+                # Frame tokens attend to [visual_prompt, frame_token] to incorporate prompt information
+                query1 = frame_token_ln  # [num_tokens_per_frame * T, BT, dim]
+                key1 = torch.zeros(self.visual_prompt_length + query1.size(0), BT, dim).to(x.device)
+                for i in range(0, BT, B):
+                    key1[:, i:i+B, :] = torch.cat((
+                        visual_prompt_ln[:, i:i+B, :],
+                        query1[:, i:i+B, :]), dim=0)
+                
                 attention_output_frames = self.attention(query1, key1, key1).reshape(-1, B, dim)
-            
-            # Step 3: Visual prompt self-attention
-            # Visual prompt tokens attend to themselves
-            query2 = visual_prompt_ln  # [visual_prompt_length, BT, dim]
-            attention_output_prompt = self.attention(query2, query2, query2)
-            
-            # Combine outputs
-            x = x + torch.cat((attention_output_prompt, attention_output_frames), dim=0)
+                
+                # Step 3: Visual prompt self-attention
+                # Visual prompt tokens attend to themselves
+                query2 = visual_prompt_ln  # [visual_prompt_length, BT, dim]
+                attention_output_prompt = self.attention(query2, query2, query2)
+                
+                # Combine outputs
+                x = x + torch.cat((attention_output_prompt, attention_output_frames), dim=0)
+            else:
+                # Extracting attention weights: x only contains frame tokens (no prompts)
+                # According to paper: use pre-trained model's self-attention module to compute attention weights
+                # This should be done WITHOUT prompts, using only frame tokens
+                frame_token = x  # [num_tokens_per_frame * T, BT, dim]
+                frame_token_ln = self.ln_1(frame_token)
+                
+                # Extract CLS token's attention weights for intra-frame attention
+                # This is the "intra-frame attention weights" mentioned in the paper
+                if return_attn_weights:
+                    # Extract CLS token from frame_token (CLS is the first token of each frame)
+                    cls_indices = [t * num_tokens_per_frame for t in range(T)]
+                    cls_tokens = frame_token_ln[cls_indices, :, :]  # [T, BT, dim]
+                    
+                    # CLS tokens attend to all frame tokens (intra-frame attention)
+                    # query = CLS tokens, key = value = frame_token
+                    # This gives us CLS token's attention to all tokens within frames
+                    # This is computed using pre-trained model's attention module, WITHOUT prompts
+                    _, attn_weights_cls = self.attention(
+                        cls_tokens, frame_token_ln, frame_token_ln, return_weights=True
+                    )
+                    # attn_weights_cls shape: [T, num_tokens_per_frame * T] (after averaging heads)
+                    # This represents CLS token's attention to all tokens within frames
+                    attn_weights_list.append(attn_weights_cls)
+                
+                # For attention weight extraction, we still need to do self-attention for feature update
+                # But this is only for maintaining the forward pass, not for discriminative region identification
+                # The attention weights for discriminative region identification are already collected above
+                attn_out = self.attention(frame_token_ln, frame_token_ln, frame_token_ln)
+                x = x + attn_out
 
         else:
             x_ln = self.ln_1(x)
